@@ -9,13 +9,13 @@ import shutil
 import preprocessing
 import argparse
 
-from skimage import io
 from tensorflow.contrib import slim
 from tensorflow.contrib.layers import xavier_initializer
 
 import resnet_v2 as resnet
+import nets.mobilenet.mobilenet_v2 as mbnv2
 from refine_net import refine_net
-from deeplabv3 import deeplabv3, deeplabv3plus
+from deeplabv3 import deeplabv3, deeplabv3plus, deeplabv3plus_lite, gap
 
 parser = argparse.ArgumentParser(description='seg')
 
@@ -31,7 +31,7 @@ parser.add_argument('--n_steps', type=int)
 parser.add_argument('--lr', type=float, default=1.0)
 parser.add_argument('--gpu', type=str)
 parser.add_argument('--bn_fix', action='store_true')
-parser.add_argument('--stride', type=int, default=32)
+parser.add_argument('--stride', type=int, default=16)
 args = parser.parse_args()
 
 os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
@@ -56,12 +56,25 @@ BLOCK_NAME = ['resnet_v2_101/block1/unit_2/bottleneck_v2',
               'resnet_v2_101/block3/unit_22/bottleneck_v2',
               'resnet_v2_101/block4/unit_3/bottleneck_v2']
 
-N_CLASS = 21
+RESNET_PATH = 'deeplabv3_mnv2_pascal_trainval/model.ckpt-30000'
+BLOCK_NAME = ['layer_4',
+              'layer_7',
+              'layer_14',
+              'layer_18']
+
+if args.data == 'human':
+    N_CLASS = 2
+else:
+    N_CLASS = 21
 EXP_NAME = args.name
 LOG_DIR = 'logs/%s' % EXP_NAME
 MODEL_DIR = 'models/%s' % EXP_NAME
-os.makedirs(LOG_DIR, exist_ok=True)
-os.makedirs(MODEL_DIR, exist_ok=True)
+if not os.path.exists(LOG_DIR):
+    os.mkdir(LOG_DIR)
+if not os.path.exists(MODEL_DIR):
+    os.mkdir(MODEL_DIR)
+# os.makedirs(LOG_DIR, exist_ok=True)
+# os.makedirs(MODEL_DIR, exist_ok=True)
 shutil.copyfile(sys.argv[0], os.path.join(LOG_DIR, sys.argv[0]))
 shutil.copyfile('preprocessing.py', '%s/preprocessing.py'%LOG_DIR)
 with open(os.path.join(LOG_DIR, 'config.json'), 'w') as f:
@@ -73,6 +86,11 @@ SAVE_FREQ = 5000
 if args.data != 'coco':
     imgs_tr = []
     lbs_tr = []
+    if args.data == 'human':
+        with open("human_train.txt") as f:
+            lines = f.readlines()
+            imgs_tr = [x.strip().split('\t')[0] for x in lines]
+            lbs_tr = [x.strip().split('\t')[1] for x in lines]
     if args.data == 'voc':
         with open("/home/zw/data/VOC2012/ImageSets/Segmentation/train.txt") as f:
             lines = f.readlines()
@@ -121,14 +139,12 @@ elif args.data == 'coco':
 
 
 def load_example():
-    if args.data != 'coco':
+    if args.data != 'coco' and args.data != 'human':
         img_dir_tr = "/home/zw/data/"
         label_dir_tr = "/home/zw/data/"
     else:
         img_dir_tr = ''
         label_dir_tr = ''
-    img_dir_val = "/home/zw/data/VOC2012/JPEGImages/"
-    label_dir_val = "/home/zw/data/VOC2012/Labels/"
     decode_img = tf.image.decode_jpeg
     decode_label = tf.image.decode_png
 
@@ -145,7 +161,8 @@ def load_example():
         im_q.set_shape([513, 513, 3])
         lb_q.set_shape([513, 513])
         im_tr, lb_tr = tf.train.batch([im_q, lb_q], BATCH_SIZE, NUM_THREADS)
-
+    if args.data == 'human':
+        lb_tr /= 128
     return im_tr, tf.to_int32(lb_tr)
 
 
@@ -167,8 +184,10 @@ def train():
         for im_trb, lb_trb, d in zip(im_trs, lb_trs, ['/device:GPU:%d'%g for g in range(n_gpu)]):
             with tf.device(d):
                 reuse = d[-1]!='0'
-                with slim.arg_scope(resnet.resnet_arg_scope(batch_norm_decay=0.9997)):
-                    _, out = resnet.resnet_v2_101(im_trb, num_classes=None, global_pool=False, output_stride=args.stride, reuse=reuse, is_training=not args.bn_fix)
+#                 with slim.arg_scope(resnet.resnet_arg_scope(batch_norm_decay=0.9997)):
+#                     _, out = resnet.resnet_v2_101(im_trb, num_classes=None, global_pool=False, output_stride=args.stride, reuse=reuse, is_training=not args.bn_fix)
+                with tf.contrib.slim.arg_scope(mbnv2.training_scope()):
+                    _, out = mbnv2.mobilenet(im_trb, num_classes=None, output_stride=args.stride, reuse=reuse, is_training=not args.bn_fix)
                 blocks = []
                 for name in BLOCK_NAME[::-1]:
                     blocks.append(out[name])
@@ -179,9 +198,14 @@ def train():
                         logits_tr = deeplabv3(blocks, N_CLASS, args.stride, args.bn_fix)
                     if args.net == 'deeplabv3plus':
                         logits_tr = deeplabv3plus(blocks, N_CLASS, args.stride, args.bn_fix)
+                    if args.net == 'deeplabv3plus_lite':
+                        logits_tr = deeplabv3plus_lite(blocks, N_CLASS, args.stride, args.bn_fix)
+                    if args.net == 'gap':
+                        logits_tr = gap(blocks, N_CLASS, args.stride, args.bn_fix)
                 ignore = tf.cast(tf.less(lb_trb, 127), tf.float32)
                 ignores.append(ignore)
-                lb_trb = tf.clip_by_value(lb_trb, 0, 20)
+                lb_trb = tf.clip_by_value(lb_trb, 0, N_CLASS-1)
+                lb_trb = tf.stop_gradient(lb_trb)
                 loss = tf.losses.sparse_softmax_cross_entropy(logits=logits_tr, labels=lb_trb, weights=ignore)
                 loss = tf.reduce_mean(loss)
                 wd = [args.wd*tf.nn.l2_loss(v) for v in tf.trainable_variables() if 'kernel' in v.name]
@@ -193,12 +217,13 @@ def train():
                     var_list=[x for x in tf.trainable_variables() if x.name.startswith('head') and (not args.bn_fix or not 'batch_norm' in x.name)]))
                 grads_f.append(trainf.compute_gradients(loss, 
                     var_list=[x for x in tf.trainable_variables() if not x.name.startswith('head') and (not args.bn_fix or not 'BatchNorm' in x.name)]))
-        assign_fn = slim.assign_from_checkpoint_fn(RESNET_PATH, [x for x in tf.global_variables() if x.name.startswith('resnet')], ignore_missing_vars=True)
+#         assign_fn = slim.assign_from_checkpoint_fn(RESNET_PATH, [x for x in tf.global_variables() if x.name.startswith('resnet')], ignore_missing_vars=True)
+        assign_fn = slim.assign_from_checkpoint_fn(RESNET_PATH, [x for x in tf.global_variables() if x.name.startswith('MobilenetV2')], ignore_missing_vars=True)
         loss = tf.add_n(losses) / n_gpu
         pred_tr = tf.concat(pred_trs, 0)
         ignore = tf.concat(ignores, 0)
         loss_tr, loss_tr_op = tf.metrics.mean(loss)
-        lb_tr = tf.clip_by_value(lb_tr, 0, 20)
+        lb_tr = tf.clip_by_value(lb_tr, 0, N_CLASS-1)
         acc_tr, acc_tr_op = tf.metrics.accuracy(pred_tr, lb_tr, ignore)
         iou_tr, iou_tr_op = tf.metrics.mean_iou(lb_tr, pred_tr, num_classes=N_CLASS, weights=ignore)
         metrics_op_tr = tf.group(loss_tr_op, acc_tr_op, iou_tr_op)
@@ -268,7 +293,9 @@ def train():
             fetches = {
                         '_': metrics_op_tr,
                         'global_step': global_step,
-                        'incr_global_step': incr_global_step}
+                        'incr_global_step': incr_global_step,}
+#                         'lb': lb_tr,
+#                         'pred': pred_tr}
             if not RESTORE_PATH and step < args.n_steps / 10:
                 fetches['train'] = train_head
             else:
@@ -280,6 +307,7 @@ def train():
             lr_decay = (1-1.*step/args.n_steps) ** 0.9
             lr_decay = max(lr_decay, 0.1)
             results = sess.run(fetches, feed_dict={LR_tensor: args.lr*lr_decay})
+#             print(results['lb'].max(), results['pred'].max(), (results['lb']!=results['pred']).sum())
             if (step+1) % DISPLAY_FREQ == 0 or step == args.n_steps-1 or ((step+1)%10 == 0 and step < 200):
                 log = '[%s][%s]STEP %d, Accuracy %.4f, Loss %8.4f, IOU %.4f' % (EXP_NAME, str(datetime.datetime.now())[:-7].replace(':', '-'), step, results['accuracy'], results['loss'], results['iou'])
                 with open('%s/LOG.txt'%LOG_DIR, 'a') as f:

@@ -31,7 +31,7 @@ def preprocess_for_train(image, label, crop_height, crop_width, scale_min, scale
     new_width = tf.to_int32(shape[1]*scale)
 
     image = tf.to_float(image)
-    label = tf.to_float(label)
+    label = tf.to_float(label[:,:,:1])
     im_lb = tf.concat([image, label], 2)
     im_lb = tf.image.random_flip_left_right(im_lb)
     image, label = tf.split(im_lb, [3,1], 2)
